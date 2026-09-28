@@ -280,6 +280,50 @@ def walk(pk, share_id, token, parent_id, rel=""):
             yield f, path
 
 
+def all_targets(pk, share_id, token, root):
+    targets = []
+    for f in root.get("files", []):
+        if f.get("kind") == "drive#folder":
+            targets += list(walk(pk, share_id, token, f["id"], f["name"]))
+        else:
+            targets.append((f, f["name"]))
+    return targets
+
+
+def resolve_targets(pk, share_id, token, root, ids):
+    """Resolve the IDs in the URL path (/s/<share>/<id>/<id>...) to files.
+
+    The trailing segments may be folders, a folder + file, or share-scoped IDs
+    that file_info does not accept, so try several strategies from the most
+    specific to the whole share.
+    """
+    for target_id in reversed(ids):
+        # 1) it is a folder -> list it
+        try:
+            items = pk.share_list(share_id, token, target_id)
+            if items:
+                log(f"URL id {target_id} is a folder")
+                return list(walk(pk, share_id, token, target_id))
+        except RuntimeError as e:
+            dbg(f"list {target_id} failed", str(e))
+        # 2) it is a file -> file_info
+        try:
+            info = pk.share_file_info(share_id, token, target_id)
+            if info.get("id") or info.get("name"):
+                return [(info, info.get("name", target_id))]
+        except RuntimeError as e:
+            dbg(f"file_info {target_id} failed", str(e))
+    everything = all_targets(pk, share_id, token, root)
+    # 3) match the ID anywhere in the share
+    for target_id in reversed(ids):
+        hit = [(f, p) for f, p in everything if f.get("id") == target_id]
+        if hit:
+            return hit
+    if ids:
+        log("could not resolve the IDs in the URL; using every file in the share")
+    return everything
+
+
 def download(url, dest, session):
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     tmp = dest + ".part"
@@ -331,18 +375,8 @@ def main():
     token = root.get("pass_code_token", "")
 
     # Build the target list
-    if file_id:
-        info = pk.share_file_info(share_id, token, file_id)
-        targets = [(info, info.get("name", file_id))]
-    elif parent_id:
-        targets = list(walk(pk, share_id, token, parent_id))
-    else:
-        targets = []
-        for f in root.get("files", []):
-            if f.get("kind") == "drive#folder":
-                targets += list(walk(pk, share_id, token, f["id"], f["name"]))
-            else:
-                targets.append((f, f["name"]))
+    dbg("root files", [(f.get("id"), f.get("name"), f.get("kind")) for f in root.get("files", [])])
+    targets = resolve_targets(pk, share_id, token, root, [i for i in (parent_id, file_id) if i])
     if not a.all:
         targets = [(f, p) for f, p in targets if is_video(f)]
     if not targets:
@@ -354,7 +388,12 @@ def main():
     # Resolve links: anonymous share/file_info first
     links = {}
     for f, p in targets:
-        info = f if best_link(f) else pk.share_file_info(share_id, token, f["id"])
+        info = f
+        if not best_link(f):
+            try:
+                info = pk.share_file_info(share_id, token, f["id"])
+            except RuntimeError as e:
+                log(f"  file_info failed for {p}: {e}")
         link = best_link(info)
         if link:
             links[f["id"]] = link
